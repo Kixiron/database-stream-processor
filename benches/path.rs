@@ -8,7 +8,6 @@ use dbsp::{
         Batch,
     },
 };
-
 use std::{collections::HashMap, fmt::Write, fs};
 
 fn main() {
@@ -24,14 +23,12 @@ fn main() {
         circuit.register_scheduler_event_handler("metadata", move |event: &SchedulerEvent| {
             match event {
                 SchedulerEvent::EvalEnd { node } => {
-                    let metadata_string = metadata
-                        .entry(node.global_id().clone())
-                        .or_insert_with(|| String::new());
+                    let metadata_string = metadata.entry(node.global_id().clone()).or_default();
                     metadata_string.clear();
                     node.summary(metadata_string);
                 }
                 SchedulerEvent::StepEnd => {
-                    let graph = monitor_clone.visualize_circuit_annotate(&|node_id| {
+                    let graph = monitor_clone.visualize_circuit_annotate(|node_id| {
                         let mut metadata_string = metadata
                             .get(node_id)
                             .map(ToString::to_string)
