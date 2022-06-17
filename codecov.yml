@@ -1,2 +1,6 @@
 comment:
-  require_changes: true
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: false
