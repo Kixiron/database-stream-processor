@@ -1,40 +1,91 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![CI workflow](https://github.com/vmware/database-stream-processor/actions/workflows/main.yml/badge.svg)](https://github.com/vmware/database-stream-processor/actions)
 [![codecov](https://codecov.io/gh/vmware/database-stream-processor/branch/main/graph/badge.svg?token=0wZcmD11gt)](https://codecov.io/gh/vmware/database-stream-processor)
 
 # Database Stream Processor
 
-Streaming and Incremental Computation Framework
+Database Stream Processor (DBSP) is a framework for computing over data streams
+that aims to be more expressive and performant than existing streaming engines.
 
-## Development tools
+## Why DBSP?
 
-Ideally this code should run fine in Linux, MacOs, and Windows.
-The code is written in Rust.  Here are some tools we found useful for development:
+Computing over streaming data is hard.  Streaming computations operate over
+changing inputs and must continuously update their outputs as new inputs arrive.
+They must do so in real time, processing new data and producing outputs with a
+bounded delay.
 
-See <https://www.twelve21.io/getting-started-with-rust-on-windows-and-visual-studio-code> about
-using Rust in VSCode.
+Existing streaming engines have limited expressive power, which is why their use
+in the modern data stack is restricted to data preparation and visualization.
+Complex business intelligence tasks are left to traditional database systems
+where they run as periodic (e.g., daily) batch jobs.  This is inadequate in the
+world that increasingly relies on real-time alerts, recommendations, control, etc.
 
-* Rust `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-* Tools for Rust
-  * tarpaulin for code coverage (Linux only): `cargo install cargo-tarpaulin`
-* Vscode: <https://code.visualstudio.com/Download>
-* Vscode extensions for Rust:
-  * crates <https://marketplace.visualstudio.com/items?itemName=serayuzgur.crates>
-  * Rust <https://marketplace.visualstudio.com/items?itemName=rust-lang.rust>
-  * Even Better TOML <https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml>
-  * Power Header <https://marketplace.visualstudio.com/items?itemName=epivision.vscode-file-header>
-    (Enables you to insert a copyright header in VSCode by pressing CTRL+ALT+H)
-  * Rust Test Explorer <https://marketplace.visualstudio.com/items?itemName=swellaby.vscode-rust-test-adapter>
-  * Rust debugger CodeLLDB <https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb>
-  * Coverage Gutters <https://marketplace.visualstudio.com/items?itemName=ryanluker.vscode-coverage-gutters>
+DBSP intends to change the situation by offering a simple promise: to **execute
+any query workload that can run in batch mode in streaming mode**.
 
-## Check test coverage
+## Overview
 
-* Run on the command line `cargo tarpaulin --out Lcov` to generate coverage information
-* Use the Coverage Gutters VSCode extension to watch the lcov file (CTRL+SHIFT+P, Coverage Gutters: Watch)
+DBSP unifies two kinds of streaming data: time series data and change data.
 
-## Set-up git hooks
+- **Time series data** can be thought of as an infinitely growing log indexed by
+  time.
 
-* Execute the following command to make `git commit` check the code before commit:
+- **Change data** represents updates (insertions, deletions, modifications) to
+  some state modeled as a table of records.
+
+In DBSP, a time series is just a table where records are only ever added and
+never removed or modified.  As a result, this table can grow unboundedly; hence
+most queries work with subsets of the table within a bounded time window.  DBSP
+does not need to wait for all data within a window to become available before
+evaluating a query (although the user may choose to do so): like all queries,
+time window queries are updated on the fly as new inputs become available.  This
+means that DBSP can work with arbitrarily large windows as long as they fit
+within available storage.
+
+DBSP queries are composed of the following classes of operators that apply to
+both time series and change data:
+
+1. **Per-record operators** that parse, validate, filter, transform data streams
+one record at a time.
+
+1. The complete set of **relational operators**: select, project, join,
+aggregate, etc.
+
+1. **Recursion**: Recursive queries express iterative computations, e.g.,
+partitioning a graph into strongly connected components.  Like all DPSP queries,
+recursive queries update their outputs incrementally as new data arrives.
+
+In addition, DBSP supports **windowing operators** that group time series data
+into time windows, including various forms of tumbling and sliding windows,
+windows driven by watermarks, etc.
+
+## Theory
+
+Delivering this functionality with strong performance and correctness guarantees
+requires building on a solid foundation.  The theory behind DBSP is described in
+the accompanying paper:
+
+- [Budiu, McSherry, Ryzhyk, Tannen. DBSP: Automatic Incremental View Maintenance
+  for Rich Query Languages](https://arxiv.org/abs/2203.16684)
+
+## Applications
+
+*TODO*
+
+## Documentation
+
+The project is still in its early days.  API and internals documentation is
+coming soon.
+
+*TODO*
+
+# Contributing
+
+## Setting up git hooks
+
+Execute the following command to make `git commit` check the code before commit:
+
 ```
 GITDIR=$(git rev-parse --git-dir)
-ln -sf $(pwd)/tools/prepush.sh ${GITDIR}/hooks/pre-push
+ln -sf $(pwd)/tools/pre-push ${GITDIR}/hooks/pre-push
 ```
