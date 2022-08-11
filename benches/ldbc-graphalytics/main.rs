@@ -136,7 +136,7 @@ fn main() {
 
         let output_inner = output.clone();
         let root = Circuit::build(move |circuit| {
-            if config.profile && Runtime::worker_index() == 0 {
+            if config.profile /*&& Runtime::worker_index() == 0*/ {
                 attach_profiling(dataset, circuit);
             }
 
@@ -342,7 +342,7 @@ fn attach_profiling(dataset: DataSet, circuit: &mut Circuit<()>) {
             });
 
             std::fs::write(
-                profile_path.join(format!("path.{}.dot", steps)),
+                profile_path.join(format!("path.{}.{}.dot", Runtime::worker_index(),steps)),
                 graph.to_dot(),
             )
             .unwrap();
