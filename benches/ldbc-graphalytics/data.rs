@@ -1,7 +1,7 @@
 use clap::{PossibleValue, ValueEnum};
 use dbsp::{
     algebra::{HasOne, Present, F64},
-    trace::{Batch, Batcher, Builder},
+    trace::{Batch, Builder},
     Circuit, OrdIndexedZSet, OrdZSet, Stream,
 };
 use indicatif::{HumanBytes, ProgressBar, ProgressState, ProgressStyle};
@@ -26,9 +26,11 @@ pub type Vertex = u64;
 pub type Weight = isize;
 pub type Distance = u64;
 
+pub type VertexVec<D = Present> = Vec<(Node, D)>;
 pub type VertexSet<D = Present> = OrdZSet<Node, D>;
 pub type RankSet = OrdZSet<(Node, Rank), Weight>;
 pub type RankMap = OrdIndexedZSet<Node, Rank, Weight>;
+pub type EdgeVec<D = Present> = Vec<(Node, (Node, D))>;
 pub type EdgeMap<D = Present> = OrdIndexedZSet<Node, Node, D>;
 pub type DistanceSet<D = Present> = OrdZSet<(Node, Distance), D>;
 
@@ -146,7 +148,7 @@ impl DataSet {
         Path::new(DATA_PATH).join(self.name)
     }
 
-    pub fn load<R: ResultParser>(&self) -> io::Result<(Properties, EdgeMap, VertexSet, R::Parsed)> {
+    pub fn load<R: ResultParser>(&self) -> io::Result<(Properties, EdgeVec, VertexVec, R::Parsed)> {
         let dataset_dir = self.dataset_dir()?;
 
         // Open & parse the properties file
@@ -612,27 +614,21 @@ impl EdgeParser {
         }
     }
 
-    pub fn load(self, approx_edges: usize) -> EdgeMap {
+    pub fn load(self, approx_edges: usize) -> EdgeVec {
         // Directed graphs can use an ordered builder
         if self.directed {
-            let mut edges = <EdgeMap as Batch>::Builder::with_capacity((), approx_edges);
-            self.parse(|src, dest| edges.push(((src, dest), Present)));
-            edges.done()
-
+            let mut edges = Vec::with_capacity(approx_edges);
+            self.parse(|src, dest| edges.push((src, (dest, Present))));
+            edges
         // Undirected graphs must use an unordered builder
         } else {
-            let mut forward_batch = Vec::with_capacity(approx_edges);
-            let mut reverse_batch = Vec::with_capacity(approx_edges);
+            let mut edges = Vec::with_capacity(2 * approx_edges);
 
             self.parse(|src, dest| {
-                forward_batch.push(((src, dest), Present));
-                reverse_batch.push(((dest, src), Present));
+                edges.push((src, (dest, Present)));
+                edges.push((dest, (src, Present)));
             });
-
-            let mut edges = <EdgeMap as Batch>::Batcher::new(());
-            edges.push_consolidated_batch(&mut forward_batch);
-            edges.push_batch(&mut reverse_batch);
-            edges.seal()
+            edges
         }
     }
 
@@ -670,11 +666,11 @@ impl VertexParser {
         }
     }
 
-    pub fn load(self, approx_vertices: usize) -> VertexSet {
+    pub fn load(self, approx_vertices: usize) -> VertexVec {
         // The vertices file is ordered so we can use an ordered builder
-        let mut vertices = <VertexSet as Batch>::Builder::with_capacity((), approx_vertices);
+        let mut vertices = Vec::with_capacity(approx_vertices);
         self.parse(|vertex| vertices.push((vertex, Present)));
-        vertices.done()
+        vertices
     }
 
     fn parse<F>(mut self, mut append: F)
