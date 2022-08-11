@@ -11,10 +11,9 @@ use dbsp::{
     algebra::{NegByRef, Present},
     circuit::{trace::SchedulerEvent, Runtime},
     monitor::TraceMonitor,
-    operator::Generator,
     profile::CPUProfiler,
     trace::{BatchReader, Cursor},
-    zset, Circuit,
+    Circuit,
 };
 use deepsize::DeepSizeOf;
 use hashbrown::HashMap;
@@ -26,13 +25,12 @@ use mimalloc_rust_sys::{
 };
 use std::{
     alloc::{GlobalAlloc, Layout},
-    cell::RefCell,
     fmt::Write as _,
     io::{self, Write},
     mem::size_of,
     num::{NonZeroU8, NonZeroUsize},
     ops::Add,
-    rc::Rc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -83,7 +81,7 @@ fn main() {
     io::stdout().flush().unwrap();
     let start = Instant::now();
 
-    let (properties, edges, vertices, _) = dataset.load::<NoopResults>().unwrap();
+    let (properties, mut edges, mut vertices, _) = dataset.load::<NoopResults>().unwrap();
     let elapsed = start.elapsed();
 
     // Calculate the amount of data that we've loaded in, including weights
@@ -114,53 +112,34 @@ fn main() {
         properties.edges,
     );
 
-    let mut root_data = Some(zset! { properties.source_vertex => Present });
-    let mut vertex_data = Some(vertices);
-    let mut edge_data = Some(edges);
-
-    Runtime::run(threads.get(), move || {
-        let init_stats = if Runtime::worker_index() == 0 {
-            print!(
-                "building dataflow{}... ",
-                if config.profile { " with profiling" } else { "" },
-            );
-            io::stdout().flush().unwrap();
-            ALLOC.reset_stats();
-            ALLOC.stats()
+    print!(
+        "building dataflow{}... ",
+        if config.profile {
+            " with profiling"
         } else {
-            AllocStats::default()
-        };
-        let start = Instant::now();
+            ""
+        },
+    );
+    io::stdout().flush().unwrap();
+    let start = Instant::now();
 
-        let output = Rc::new(RefCell::new(OutputData::None));
+    ALLOC.reset_stats();
+    let init_stats = ALLOC.stats();
 
-        let output_inner = output.clone();
-        let root = Circuit::build(move |circuit| {
-            if config.profile /*&& Runtime::worker_index() == 0*/ {
+    let output = Arc::new(Mutex::new(OutputData::None));
+    let output_inner = output.clone();
+
+    let (mut dbsp, (root_handle, mut vertices_handle, mut edges_handle)) =
+        Runtime::init_circuit(threads.get(), move |circuit| {
+            if config.profile
+            /* && Runtime::worker_index() == 0 */
+            {
                 attach_profiling(dataset, circuit);
             }
 
-            let roots = circuit.region("roots", || {
-                circuit.add_source(Generator::new(move || if Runtime::worker_index() == 0 {
-                    root_data.take().unwrap()
-                } else {
-                    Default::default()
-                }))
-            });
-            let vertices = circuit.region("vertices", || {
-                circuit.add_source(Generator::new(move || if Runtime::worker_index() == 0 {
-                    vertex_data.take().unwrap()
-                } else {
-                    Default::default()
-                }))
-            });
-            let edges = circuit.region("edges", || {
-                circuit.add_source(Generator::new(move || if Runtime::worker_index() == 0 {
-                    edge_data.take().unwrap()
-                } else {
-                    Default::default()
-                }))
-            });
+            let (roots, roots_handle) = circuit.add_input_zset();
+            let (vertices, vertices_handle) = circuit.add_input_zset();
+            let (edges, edges_handle) = circuit.add_input_indexed_zset();
 
             match args {
                 Args::Bfs { .. } => {
@@ -168,14 +147,14 @@ fn main() {
                         .gather(0)
                         .inspect(move |results| {
                             if Runtime::worker_index() == 0 {
-                                *output_inner.borrow_mut() = OutputData::Bfs(results.clone());
+                                *output_inner.lock().unwrap() = OutputData::Bfs(results.clone());
                             } else {
                                 assert!(results.is_empty());
                             }
                         });
                 }
 
-                Args::Pagerank {  .. } => {
+                Args::Pagerank { .. } => {
                     pagerank::pagerank(
                         properties.pagerank_iters.unwrap(),
                         properties.pagerank_damping_factor.unwrap(),
@@ -185,7 +164,7 @@ fn main() {
                     .gather(0)
                     .inspect(move |results| {
                         if Runtime::worker_index() == 0 {
-                            *output_inner.borrow_mut() = OutputData::PageRank(results.clone());
+                            *output_inner.lock().unwrap() = OutputData::PageRank(results.clone());
                         } else {
                             assert!(results.is_empty());
                         }
@@ -193,114 +172,118 @@ fn main() {
                 }
 
                 Args::ListDatasets { .. } | Args::ListDownloaded { .. } => unreachable!(),
-            }
+            };
+            (roots_handle, vertices_handle, edges_handle)
         })
-        .unwrap().0;
+        .unwrap();
 
-        if Runtime::worker_index() == 0 {
-            let elapsed = start.elapsed();
-            print!("finished in {elapsed:#?}\nrunning benchmark... ");
-            io::stdout().flush().unwrap();
+    let elapsed = start.elapsed();
+    print!("finished in {elapsed:#?}\n");
+    io::stdout().flush().unwrap();
+
+    print!("pushing data to DBSP...");
+    io::stdout().flush().unwrap();
+    let start = Instant::now();
+
+    vertices_handle.append(&mut vertices);
+    edges_handle.append(&mut edges);
+    root_handle.push(properties.source_vertex, Present);
+
+    let elapsed = start.elapsed();
+    println!("finished in {elapsed:#?}\nrunning benchmark...");
+
+    let start = Instant::now();
+    dbsp.step().unwrap();
+    let elapsed = start.elapsed();
+
+    let stats = ALLOC.stats();
+    println!(
+        "finished in {elapsed:#?}\ntime: {:#?}, user: {:#?}, system: {:#?}\nrss: {}, peak: {}\ncommit: {}, peak: {}\npage faults: {}",
+        Duration::from_millis((stats.elapsed_ms - init_stats.elapsed_ms) as u64),
+        Duration::from_millis((stats.user_ms - init_stats.user_ms) as u64),
+        Duration::from_millis((stats.system_ms - init_stats.system_ms) as u64),
+        HumanBytes(stats.current_rss as u64),
+        HumanBytes(stats.peak_rss as u64),
+        HumanBytes(stats.current_commit as u64),
+        HumanBytes(stats.peak_commit as u64),
+        stats.page_faults,
+    );
+
+    // Metrics calculations from https://arxiv.org/pdf/2011.15028v4.pdf#subsection.2.5.3
+    let eps = properties.edges as f64 / elapsed.as_secs_f64();
+    let keps = eps / 1000.0;
+    println!("achieved {keps:.02} kEPS ({eps:.02} EPS)");
+
+    let elements = properties.edges + properties.vertices;
+    let evps = elements as f64 / elapsed.as_secs_f64();
+    let kevps = evps / 1000.0;
+    println!("achieved {kevps:.02} kEVPS ({evps:.02} EVPS)");
+
+    match &*output.lock().unwrap() {
+        OutputData::None => println!("no output was produced"),
+
+        OutputData::Bfs(result) => {
+            let expected = dataset.load_results::<BfsResults>(&properties).unwrap();
+            // TODO: Better diff function
+            assert_eq!(result, &expected);
         }
 
-        let start = Instant::now();
-        root.step().unwrap();
-        let elapsed = start.elapsed();
+        OutputData::PageRank(result) => {
+            let expected = dataset
+                .load_results::<PageRankResults>(&properties)
+                .unwrap();
+            let difference = expected.add(result.neg_by_ref());
 
-        if Runtime::worker_index() == 0 {
-            let stats = ALLOC.stats();
-            println!(
-                "finished in {elapsed:#?}\ntime: {:#?}, user: {:#?}, system: {:#?}\nrss: {}, peak: {}\ncommit: {}, peak: {}\npage faults: {}",
-                Duration::from_millis((stats.elapsed_ms - init_stats.elapsed_ms) as u64),
-                Duration::from_millis((stats.user_ms - init_stats.user_ms) as u64),
-                Duration::from_millis((stats.system_ms - init_stats.system_ms) as u64),
-                HumanBytes(stats.current_rss as u64),
-                HumanBytes(stats.peak_rss as u64),
-                HumanBytes(stats.current_commit as u64),
-                HumanBytes(stats.peak_commit as u64),
-                stats.page_faults,
-            );
+            let mut incorrect = 0;
+            if !difference.is_empty() {
+                let mut stdout = io::stdout().lock();
+                let mut cursor = difference.cursor();
 
-            // Metrics calculations from https://arxiv.org/pdf/2011.15028v4.pdf#subsection.2.5.3
-            let eps = properties.edges as f64 / elapsed.as_secs_f64();
-            let keps = eps / 1000.0;
-            println!("achieved {keps:.02} kEPS ({eps:.02} EPS)");
+                while cursor.key_valid() {
+                    let key = *cursor.key();
 
-            let elements = properties.edges + properties.vertices;
-            let evps = elements as f64 / elapsed.as_secs_f64();
-            let kevps = evps / 1000.0;
-            println!("achieved {kevps:.02} kEVPS ({evps:.02} EVPS)");
+                    if let Some(first) = cursor.get_val().copied() {
+                        let first_weight = cursor.weight();
+                        cursor.step_val();
 
-            let output = output.borrow();
-            match &*output {
-                OutputData::None => println!("no output was produced"),
+                        if let Some(second) = cursor.get_val().copied() {
+                            let second_weight = cursor.weight();
+                            cursor.step_val();
 
-                OutputData::Bfs(result) => {
-                    let expected = dataset.load_results::<BfsResults>(&properties).unwrap();
-                    // TODO: Better diff function
-                    assert_eq!(result, &expected);
-                }
+                            // Sometimes the values are only different because of floating point
+                            // inaccuracies, e.g. 0.14776291666666666 vs. 0.1477629166666667
+                            if (first - second).abs() > Rank::EPSILON {
+                                let (first, first_weight, second, second_weight) =
+                                    if first_weight.is_positive() && second_weight.is_negative() {
+                                        (second, second_weight, first, first_weight)
+                                    } else {
+                                        (first, first_weight, second, second_weight)
+                                    };
 
-                OutputData::PageRank(result) => {
-                    let expected = dataset.load_results::<PageRankResults>(&properties).unwrap();
-                    let difference = expected.add(result.neg_by_ref());
-
-                    let mut incorrect = 0;
-                    if !difference.is_empty() {
-                        let mut stdout = io::stdout().lock();
-                        let mut cursor = difference.cursor();
-
-                        while cursor.key_valid() {
-                            let key = *cursor.key();
-
-                            if let Some(first) = cursor.get_val().copied() {
-                                let first_weight = cursor.weight();
-                                cursor.step_val();
-
-                                if let Some(second) = cursor.get_val().copied() {
-                                    let second_weight = cursor.weight();
-                                    cursor.step_val();
-
-                                    // Sometimes the values are only different because of floating point
-                                    // inaccuracies, e.g. 0.14776291666666666 vs. 0.1477629166666667
-                                    if (first - second).abs() > Rank::EPSILON {
-                                        let (first, first_weight, second, second_weight) = if first_weight.is_positive()
-                                            && second_weight.is_negative()
-                                        {
-                                            (second, second_weight, first, first_weight)
-                                        } else {
-                                            (first, first_weight, second, second_weight)
-                                        };
-
-                                        writeln!(stdout, "{key}, expected {second} and got {first}  ({first_weight:+}, {second_weight:+})")
-                                            .unwrap();
-                                        incorrect += 1;
-                                    }
-                                } else if first_weight.is_positive() {
-                                    writeln!(stdout, "{key}, missing: {first} ({first_weight:+})")
-                                        .unwrap();
-                                } else {
-                                    writeln!(stdout, "{key}, unexpected: {first} ({first_weight:+})")
-                                        .unwrap();
-                                }
+                                writeln!(stdout, "{key}, expected {second} and got {first}  ({first_weight:+}, {second_weight:+})")
+                                    .unwrap();
+                                incorrect += 1;
                             }
-
-                            cursor.step_key();
+                        } else if first_weight.is_positive() {
+                            writeln!(stdout, "{key}, missing: {first} ({first_weight:+})").unwrap();
+                        } else {
+                            writeln!(stdout, "{key}, unexpected: {first} ({first_weight:+})")
+                                .unwrap();
                         }
-
-                        stdout.flush().unwrap();
                     }
 
-                    println!(
-                        "pagerank had {incorrect} incorrect result{}",
-                        if incorrect == 1 { "" } else { "s" },
-                    );
+                    cursor.step_key();
                 }
+
+                stdout.flush().unwrap();
             }
+
+            println!(
+                "pagerank had {incorrect} incorrect result{}",
+                if incorrect == 1 { "" } else { "s" },
+            );
         }
-    })
-    .join()
-    .unwrap();
+    };
 }
 
 fn attach_profiling(dataset: DataSet, circuit: &mut Circuit<()>) {
@@ -342,7 +325,7 @@ fn attach_profiling(dataset: DataSet, circuit: &mut Circuit<()>) {
             });
 
             std::fs::write(
-                profile_path.join(format!("path.{}.{}.dot", Runtime::worker_index(),steps)),
+                profile_path.join(format!("path.{}.{}.dot", Runtime::worker_index(), steps)),
                 graph.to_dot(),
             )
             .unwrap();
