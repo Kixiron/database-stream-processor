@@ -31,6 +31,10 @@ pub struct OrdZSet<K, R> {
 }
 
 impl<K, R> OrdZSet<K, R> {
+    pub const fn empty() -> Self {
+        Self::from_layer(ColumnLayer::empty())
+    }
+
     pub const fn from_layer(layer: ColumnLayer<K, R>) -> Self {
         Self {
             layer,
@@ -392,24 +396,28 @@ where
     fn seek_key(&mut self, key: &K) {
         // /*
         self.index.crack(self.cursor.storage().keys(), |index| {
-            let current = self.cursor.position();
-            // Interestingly it seems that *not* limiting the binary search to values past
-            // the current cursor's position yields significantly better performance (in my
-            // tests turing 84 seconds for the ldbc datagen-8_4-fb benchmark to 73 seconds
-            // for a ~13% improvement)
+            if cfg!(debug_assertions) {
+                assert!(crate::utils::is_sorted_by(index, |a, b| unsafe {
+                    Some(a.as_ref().cmp(b.as_ref()))
+                }));
+            }
 
-            match index.binary_search_by(|&rhs| unsafe { key.cmp(rhs.as_ref()) }) {
+            let current = self.cursor.position();
+            let bucket_size = ZSetIndex::<K>::BUCKET_SIZE;
+            let offset = current / bucket_size;
+
+            match index[offset..].binary_search_by(|&rhs| unsafe { rhs.as_ref().cmp(key) }) {
                 // If one of the index values is the same as the key, we can advance directly to
                 // that value
                 Ok(idx) => self
                     .cursor
-                    .advance_to(max(idx * ZSetIndex::<K>::BUCKET_SIZE, current)),
+                    .advance_to(max((idx + offset) * bucket_size, current)),
 
                 // Otherwise the value should lie between the `idx` and `idx + 1` buckets (the
                 // first element in the layer is skipped)
                 Err(idx) => {
                     self.cursor
-                        .advance_to(max(idx * ZSetIndex::<K>::BUCKET_SIZE, current));
+                        .advance_to(max((idx + offset) * bucket_size, current));
                     self.cursor.seek_key(key);
                 }
             }
@@ -451,7 +459,7 @@ where
     }
 }
 
-/// A builder for creating layers from unsorted update tuples.
+/// A builder for creating layers from sorted update tuples.
 #[derive(SizeOf)]
 pub struct OrdZSetBuilder<K, R>
 where
@@ -545,5 +553,100 @@ impl<'a, K, R> ValueConsumer<'a, (), R, ()> for OrdZSetValueConsumer<'a, K, R> {
 
     fn remaining_values(&self) -> usize {
         self.values.remaining_values()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        trace::{Batch, BatchReader, Batcher, Builder, Cursor},
+        OrdZSet,
+    };
+    use proptest::{
+        collection::vec,
+        prelude::any,
+        prop_assert_eq, proptest,
+        strategy::{Just, Strategy},
+    };
+    use std::{cmp::max, convert::identity};
+
+    #[test]
+    fn seek_key_smoke() {
+        let set = {
+            let mut builder = <OrdZSet<u32, i32> as Batch>::Builder::with_capacity((), 100_000_000);
+            builder.extend((0..100_000_000).map(|key| (key, 1)));
+            builder.done()
+        };
+        let mut cursor = set.cursor();
+
+        let needles = [
+            0,
+            1,
+            100,
+            10_000,
+            11_000,
+            100_000,
+            0,
+            100,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_100_000,
+            5_000_000,
+            50_000_000,
+            5_000_111,
+            535,
+            99_060_430,
+            500_000_000,
+            500_000_000,
+        ];
+        for needle in needles {
+            let previous_position = cursor.cursor.position();
+            cursor.seek_key(&needle);
+
+            let position = cursor.cursor.position();
+            let expected_position = max(
+                cursor
+                    .cursor
+                    .storage()
+                    .keys()
+                    .binary_search(&needle)
+                    .unwrap_or_else(identity),
+                previous_position,
+            );
+
+            assert_eq!(position, expected_position);
+        }
+    }
+
+    fn zset(length: usize) -> impl Strategy<Value = OrdZSet<u32, i32>> {
+        vec(any::<u32>().prop_flat_map(|key| (Just(key), 1..=1)), length).prop_map(|mut batch| {
+            let mut batcher = <OrdZSet<u32, i32> as Batch>::Batcher::new_batcher(());
+            batcher.push_batch(&mut batch);
+            batcher.seal()
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn seek_key_sanity(set in zset(100_000), mut needles in any::<[u32; 5]>()) {
+            needles.sort();
+
+            let mut cursor = set.cursor();
+
+            for needle in needles {
+                cursor.seek_key(&needle);
+
+                let position = cursor.cursor.position();
+                let expected_position = cursor
+                    .cursor
+                    .storage()
+                    .keys()
+                    .binary_search(&needle)
+                    .unwrap_or_else(identity);
+
+                prop_assert_eq!(position, expected_position);
+            }
+        }
     }
 }

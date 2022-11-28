@@ -3,7 +3,7 @@ use std::{cell::RefCell, ptr::NonNull};
 
 #[derive(Debug, Clone, SizeOf)]
 pub struct ZSetIndex<K> {
-    index: RefCell<Option<Vec<NonNull<K>>>>,
+    pub(super) index: RefCell<Option<Vec<NonNull<K>>>>,
 }
 
 impl<K> ZSetIndex<K> {

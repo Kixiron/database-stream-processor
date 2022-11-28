@@ -343,7 +343,7 @@ where
 
     fn extend<It>(&mut self, iter: It)
     where
-        It: Iterator<Item = (B::Item, B::R)>,
+        It: IntoIterator<Item = (B::Item, B::R)>,
     {
         self.builder.extend(iter);
     }

@@ -915,7 +915,7 @@ mod test {
                     if Runtime::worker_index() == 0 {
                         input1.next().unwrap()
                     } else {
-                        <OrdZSet<_, _>>::empty(())
+                        OrdZSet::empty()
                     }
                 }))
                 .index();
@@ -924,7 +924,7 @@ mod test {
                     if Runtime::worker_index() == 0 {
                         input2.next().unwrap()
                     } else {
-                        <OrdZSet<_, _>>::empty(())
+                        OrdZSet::empty()
                     }
                 }))
                 .index();

@@ -4,6 +4,7 @@ mod vec_ext;
 pub(crate) use vec_ext::VecExt;
 
 use std::{
+    cmp::Ordering,
     hint::unreachable_unchecked,
     mem::{ManuallyDrop, MaybeUninit},
 };
@@ -54,4 +55,24 @@ pub(crate) fn cast_uninit_vec<T>(vec: Vec<T>) -> Vec<MaybeUninit<T>> {
 
     // Create a new vec with the different type
     unsafe { Vec::from_raw_parts(ptr.cast::<MaybeUninit<T>>(), len, cap) }
+}
+
+pub(crate) fn is_sorted_by<T, F>(slice: &[T], mut compare: F) -> bool
+where
+    F: FnMut(&T, &T) -> Option<Ordering>,
+{
+    let mut iter = slice.iter();
+    let mut last = match iter.next() {
+        Some(item) => item,
+        None => return true,
+    };
+
+    iter.all(move |current| {
+        if let Some(Ordering::Greater) | None = compare(last, current) {
+            return false;
+        }
+
+        last = current;
+        true
+    })
 }

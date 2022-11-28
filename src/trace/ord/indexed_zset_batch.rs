@@ -458,12 +458,12 @@ where
         self.index
             .crack(self.cursor.storage().key_values(), |index| {
                 let current = self.cursor.position();
-                match index.binary_search_by(|&rhs| unsafe { key.cmp(rhs.as_ref()) }) {
+                match index.binary_search_by(|&rhs| unsafe { rhs.as_ref().cmp(key) }) {
                     // If one of the index values is the same as the key, we can advance directly to
                     // that value
-                    Ok(idx) => self.cursor.advance_to(
-                        max(idx * ZSetIndex::<K>::BUCKET_SIZE, current).saturating_sub(1),
-                    ),
+                    Ok(idx) => self
+                        .cursor
+                        .advance_to(max(idx * ZSetIndex::<K>::BUCKET_SIZE, current)),
 
                     // Otherwise the value should lie between the `idx - 1` and `idx` buckets
                     Err(idx) => {
@@ -475,7 +475,7 @@ where
                     }
                 }
             });
-        */
+         */
 
         self.cursor.seek(key);
     }

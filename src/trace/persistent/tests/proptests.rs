@@ -239,16 +239,10 @@ fn cursor_trait<B, I>(
     B::R: Arbitrary + Ord + Clone + MonoidValue + Encode + Decode,
     B::Time: Arbitrary + Clone + Encode + Decode + Default,
 {
-    // Builder interface wants sorted, unique(?) keys:
-    data.sort_unstable();
-    data.dedup_by(|a, b| a.0.eq(&b.0));
-
     // Instantiate a Batch
-    let mut batch_builder = B::Builder::new_builder(B::Time::default());
-    for data_tuple in data.into_iter() {
-        batch_builder.push(data_tuple);
-    }
-    let batch = batch_builder.done();
+    let mut batcher = B::Batcher::new_batcher(B::Time::default());
+    batcher.push_batch(&mut data);
+    let batch = batcher.done();
 
     let mut model = Spine::<B>::new(None);
     model.insert(batch.clone());

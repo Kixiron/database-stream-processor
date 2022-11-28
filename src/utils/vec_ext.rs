@@ -58,24 +58,11 @@ impl<T> VecExt<T> for Vec<T> {
         self.set_len(len + 1);
     }
 
-    fn is_sorted_by<F>(&self, mut compare: F) -> bool
+    fn is_sorted_by<F>(&self, compare: F) -> bool
     where
         F: FnMut(&T, &T) -> Option<Ordering>,
     {
-        let mut iter = self.iter();
-        let mut last = match iter.next() {
-            Some(item) => item,
-            None => return true,
-        };
-
-        iter.all(move |current| {
-            if let Some(Ordering::Greater) | None = compare(last, current) {
-                return false;
-            }
-
-            last = current;
-            true
-        })
+        super::is_sorted_by(self, compare)
     }
 }
 

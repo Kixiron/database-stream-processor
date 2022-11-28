@@ -5,7 +5,7 @@
 /// [`OrdIndexedZSet`](crate::trace::ord::OrdIndexedZSet)s.
 #[macro_export]
 macro_rules! indexed_zset {
-    ( $($key:expr => { $($value:expr => $weight:expr),* }),* $(,)?) => {{
+    ( $($key:expr => { $($value:expr => $weight:expr),* $(,)? }),* $(,)?) => {{
         let mut batcher = <<$crate::trace::ord::OrdIndexedZSet<_, _, _> as $crate::trace::Batch>::Batcher as $crate::trace::Batcher<_, _, _, _>>::new_batcher(());
         let mut batch = ::std::vec![ $( $( (($key, $value), $weight) ),* ),* ];
         $crate::trace::Batcher::push_batch(&mut batcher, &mut batch);
@@ -19,6 +19,8 @@ macro_rules! indexed_zset {
 /// It generates a Z-set of type [`OrdZSet`](crate::trace::ord::OrdZSet)s.
 #[macro_export]
 macro_rules! zset {
+    () => {{ $crate::trace::ord::OrdZSet::empty() }};
+
     ( $( $key:expr => $weight:expr ),* $(,)?) => {{
         let mut batcher = <<$crate::trace::ord::OrdZSet<_, _> as $crate::trace::Batch>::Batcher as $crate::trace::Batcher<_, _, _, _>>::new_batcher(());
 
@@ -34,6 +36,8 @@ macro_rules! zset {
 /// It generates a Z-set of type [`OrdZSet`](crate::trace::ord::OrdZSet)s.
 #[macro_export]
 macro_rules! zset_set {
+    () => {{ $crate::trace::ord::OrdZSet::empty() }};
+
     ( $( $key:expr ),* $(,)?) => {{
         let mut batcher = <<$crate::trace::ord::OrdZSet<_, _> as $crate::trace::Batch>::Batcher as $crate::trace::Batcher<_, _, _, _>>::new_batcher(());
 

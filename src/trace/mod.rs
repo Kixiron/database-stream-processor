@@ -328,7 +328,11 @@ where
 
     /// Adds an ordered sequence of elements to the batch.
     #[inline]
-    fn extend<It: Iterator<Item = (I, R)>>(&mut self, iter: It) {
+    fn extend<It>(&mut self, iter: It)
+    where
+        It: IntoIterator<Item = (I, R)>,
+    {
+        let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
         self.reserve(upper.unwrap_or(lower));
 

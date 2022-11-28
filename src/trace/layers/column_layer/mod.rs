@@ -14,12 +14,12 @@ use crate::{
     algebra::{AddAssignByRef, AddByRef, HasZero, NegByRef},
     trace::layers::Trie,
     utils::{assume, cast_uninit_vec},
-    DBData, DBWeight, NumEntries,
+    NumEntries,
 };
 use size_of::SizeOf;
 use std::{
     cmp::min,
-    fmt::{self, Display},
+    fmt::{self, Debug, Display},
     mem::MaybeUninit,
     ops::{Add, AddAssign, Neg},
     ptr,
@@ -27,7 +27,7 @@ use std::{
 };
 
 /// A layer of unordered values
-#[derive(Debug, Clone, Eq, PartialEq, SizeOf)]
+#[derive(Clone, Eq, PartialEq, SizeOf)]
 pub struct ColumnLayer<K, R> {
     // Invariant: keys.len == diffs.len
     pub(super) keys: Vec<K>,
@@ -345,13 +345,27 @@ where
     }
 }
 
-impl<K, R> Display for ColumnLayer<K, R>
+impl<K, R> Debug for ColumnLayer<K, R>
 where
-    K: DBData,
-    R: DBWeight,
+    K: Debug,
+    R: Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.cursor().fmt(f)
+        unsafe { self.assume_invariants() }
+
+        f.debug_map()
+            .entries(self.keys.iter().zip(&self.diffs))
+            .finish()
+    }
+}
+
+impl<K, R> Display for ColumnLayer<K, R>
+where
+    K: Debug,
+    R: Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Debug::fmt(self, f)
     }
 }
 
