@@ -11,7 +11,7 @@ use crate::{
             Builder as TrieBuilder, Cursor as TrieCursor, MergeBuilder, OrdOffset, Trie,
             TupleBuilder,
         },
-        ord::merge_batcher::MergeBatcher,
+        ord::{merge_batcher::MergeBatcher, zset_index::ZSetIndex},
         Batch, BatchReader, Builder, Consumer, Cursor, Merger, ValueConsumer,
     },
     DBData, DBWeight, NumEntries,
@@ -28,7 +28,7 @@ use std::{
 type Layers<K, V, R, O> = OrderedLayer<K, ColumnLayer<V, R>, O>;
 
 /// An immutable collection of update tuples.
-#[derive(Debug, Clone, Eq, PartialEq, SizeOf)]
+#[derive(Debug, Clone, SizeOf)]
 pub struct OrdIndexedZSet<K, V, R, O = usize>
 where
     K: Ord,
@@ -38,6 +38,43 @@ where
 {
     /// Where all the data is.
     pub(crate) layer: Layers<K, V, R, O>,
+    index: ZSetIndex<K>,
+}
+
+impl<K, V, R, O> OrdIndexedZSet<K, V, R, O>
+where
+    K: Ord,
+    V: Ord,
+    R: Clone,
+    O: OrdOffset,
+{
+    pub(crate) const fn from_layers(layer: Layers<K, V, R, O>) -> Self {
+        Self {
+            layer,
+            index: ZSetIndex::uninit(),
+        }
+    }
+}
+
+impl<K, V, R, O> PartialEq for OrdIndexedZSet<K, V, R, O>
+where
+    K: Ord + PartialEq,
+    V: Ord + PartialEq,
+    R: Clone + PartialEq,
+    O: OrdOffset + PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.layer == other.layer
+    }
+}
+
+impl<K, V, R, O> Eq for OrdIndexedZSet<K, V, R, O>
+where
+    K: Ord + Eq,
+    V: Ord + Eq,
+    R: Clone + Eq,
+    O: OrdOffset + Eq,
+{
 }
 
 impl<K, V, R, O> Display for OrdIndexedZSet<K, V, R, O>
@@ -79,7 +116,7 @@ where
 {
     #[inline]
     fn from(layer: Layers<K, V, R, O>) -> Self {
-        Self { layer }
+        Self::from_layers(layer)
     }
 }
 
@@ -125,9 +162,7 @@ where
 {
     #[inline]
     fn neg_by_ref(&self) -> Self {
-        Self {
-            layer: self.layer.neg_by_ref(),
-        }
+        Self::from_layers(self.layer.neg_by_ref())
     }
 }
 
@@ -144,6 +179,7 @@ where
     fn neg(self) -> Self {
         Self {
             layer: self.layer.neg(),
+            index: self.index,
         }
     }
 }
@@ -160,9 +196,7 @@ where
     #[inline]
 
     fn add(self, rhs: Self) -> Self::Output {
-        Self {
-            layer: self.layer.add(rhs.layer),
-        }
+        Self::from_layers(self.layer.add(rhs.layer))
     }
 }
 
@@ -175,6 +209,7 @@ where
 {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
+        self.index.invalidate();
         self.layer.add_assign(rhs.layer);
     }
 }
@@ -188,6 +223,7 @@ where
 {
     #[inline]
     fn add_assign_by_ref(&mut self, rhs: &Self) {
+        self.index.invalidate();
         self.layer.add_assign_by_ref(&rhs.layer);
     }
 }
@@ -201,9 +237,7 @@ where
 {
     #[inline]
     fn add_by_ref(&self, rhs: &Self) -> Self {
-        Self {
-            layer: self.layer.add_by_ref(&rhs.layer),
-        }
+        Self::from_layers(self.layer.add_by_ref(&rhs.layer))
     }
 }
 
@@ -228,6 +262,7 @@ where
     fn cursor(&self) -> Self::Cursor<'_> {
         OrdIndexedZSetCursor {
             cursor: self.layer.cursor(),
+            index: &self.index,
         }
     }
 
@@ -296,6 +331,7 @@ where
     fn empty(_time: Self::Time) -> Self {
         Self {
             layer: OrderedLayer::default(),
+            index: ZSetIndex::empty(),
         }
     }
 }
@@ -337,9 +373,7 @@ where
 
     #[inline]
     fn done(self) -> OrdIndexedZSet<K, V, R, O> {
-        OrdIndexedZSet {
-            layer: self.result.done(),
-        }
+        OrdIndexedZSet::from_layers(self.result.done())
     }
 
     #[inline]
@@ -366,6 +400,7 @@ where
     O: OrdOffset + PartialEq,
 {
     cursor: OrderedCursor<'s, K, O, ColumnLayer<V, R>>,
+    index: &'s ZSetIndex<K>,
 }
 
 impl<'s, K, V, R, O> Cursor<'s, K, V, (), R> for OrdIndexedZSetCursor<'s, K, V, R, O>
@@ -419,6 +454,29 @@ where
     }
 
     fn seek_key(&mut self, key: &K) {
+        /*
+        self.index
+            .crack(self.cursor.storage().key_values(), |index| {
+                let current = self.cursor.position();
+                match index.binary_search_by(|&rhs| unsafe { key.cmp(rhs.as_ref()) }) {
+                    // If one of the index values is the same as the key, we can advance directly to
+                    // that value
+                    Ok(idx) => self.cursor.advance_to(
+                        max(idx * ZSetIndex::<K>::BUCKET_SIZE, current).saturating_sub(1),
+                    ),
+
+                    // Otherwise the value should lie between the `idx - 1` and `idx` buckets
+                    Err(idx) => {
+                        self.cursor.advance_to(max(
+                            idx.saturating_sub(1) * ZSetIndex::<K>::BUCKET_SIZE,
+                            current,
+                        ));
+                        self.cursor.seek(key);
+                    }
+                }
+            });
+        */
+
         self.cursor.seek(key);
     }
 
@@ -499,9 +557,7 @@ where
 
     #[inline(never)]
     fn done(self) -> OrdIndexedZSet<K, V, R, O> {
-        OrdIndexedZSet {
-            layer: self.builder.done(),
-        }
+        OrdIndexedZSet::from_layers(self.builder.done())
     }
 }
 

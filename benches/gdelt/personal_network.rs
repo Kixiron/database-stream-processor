@@ -125,6 +125,36 @@ pub fn personal_network(
     joined.integrate()
 }
 
+// fn topk<C>(
+//     stream: &Stream<Circuit<C>, OrdZSet<(ArcStr, ArcStr), i32>>,
+//     k: usize,
+// ) -> Stream<Circuit<C>, OrdZSet<(ArcStr, ArcStr), i32>>
+// where
+//     C: Clone + 'static,
+// {
+//     stream
+//         .shard()
+//         .apply_core(
+//             "TopK Buckets",
+//             move |mut shard| {
+//                 shard.truncate(k);
+//                 shard
+//             },
+//             move |shard| shard.truncate_clone(k),
+//             |_| true,
+//         )
+//         .gather(0)
+//         .apply_core(
+//             "TopK Final",
+//             move |mut shard| {
+//                 shard.truncate(k);
+//                 shard
+//             },
+//             move |shard| shard.truncate_clone(k),
+//             |_| true,
+//         )
+// }
+
 // TODO: Hash collections/traces
 fn hashjoin<C, F, Iter, K, V1, V2, R, Z>(
     left: &Stream<Circuit<C>, OrdIndexedZSet<K, V1, R>>,

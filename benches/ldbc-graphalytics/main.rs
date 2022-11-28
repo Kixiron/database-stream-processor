@@ -6,8 +6,8 @@ mod pagerank;
 
 use crate::{
     data::{
-        list_datasets, list_downloaded_benchmarks, BfsResults, DataSet, DistanceSet, Node,
-        NoopResults, PageRankResults, Rank, RankMap,
+        list_datasets, list_downloaded_benchmarks, optimize_dataset, BfsResults, DataSet,
+        DistanceSet, Node, NoopResults, PageRankResults, Rank, RankMap,
     },
     mimalloc::{AllocStats, MiMalloc},
 };
@@ -83,6 +83,11 @@ fn main() {
             list_downloaded_benchmarks();
             return;
         }
+
+        Args::OptimizeDataset { .. } => {
+            optimize_dataset(dataset);
+            return;
+        }
     }
 
     print!("loading dataset {}... ", dataset.name);
@@ -152,9 +157,9 @@ fn main() {
 
         let output = Rc::new(RefCell::new(OutputData::None));
 
-        let output_inner = output.clone();
         let args_for_circuit = args.clone();
-        let root = Circuit::build(move |circuit| {
+        let (output_owned, output_borrowed) = (output.clone(), output.clone());
+        let (root, ()) = Circuit::build(move |circuit| {
             if config.profile && is_leader {
                 attach_profiling(dataset, circuit);
             }
@@ -179,13 +184,24 @@ fn main() {
                 Args::Bfs { .. } => {
                     bfs::bfs(roots, vertices, edges)
                         .gather(0)
-                        .inspect(move |results| {
-                            if is_leader {
-                                *output_inner.borrow_mut() = OutputData::Bfs(results.clone());
-                            } else {
-                                assert!(results.is_empty());
-                            }
-                        });
+                        .apply_core(
+                            "Take Outputs",
+                            move |results| {
+                                if is_leader {
+                                    *output_owned.borrow_mut() = OutputData::Bfs(results);
+                                } else {
+                                    assert!(results.is_empty());
+                                }
+                            },
+                            move |results| {
+                                if is_leader {
+                                    *output_borrowed.borrow_mut() = OutputData::Bfs(results.clone());
+                                } else {
+                                    assert!(results.is_empty());
+                                }
+                            },
+                            |_| true,
+                        );
                 }
 
                 Args::Pagerank {  .. } => {
@@ -196,19 +212,30 @@ fn main() {
                         edges,
                     )
                     .gather(0)
-                    .inspect(move |results| {
-                        if is_leader {
-                            *output_inner.borrow_mut() = OutputData::PageRank(results.clone());
-                        } else {
-                            assert!(results.is_empty());
-                        }
-                    });
+                    .apply_core(
+                        "Take Outputs",
+                        move |results| {
+                            if is_leader {
+                                *output_owned.borrow_mut() = OutputData::PageRank(results);
+                            } else {
+                                assert!(results.is_empty());
+                            }
+                        },
+                        move |results| {
+                            if is_leader {
+                                *output_borrowed.borrow_mut() = OutputData::PageRank(results.clone());
+                            } else {
+                                assert!(results.is_empty());
+                            }
+                        },
+                        |_| true,
+                    );
                 }
 
-                Args::ListDatasets { .. } | Args::ListDownloaded { .. } => unreachable!(),
+                Args::OptimizeDataset { .. } | Args::ListDatasets { .. } | Args::ListDownloaded { .. } => unreachable!(),
             }
         })
-        .unwrap().0;
+        .unwrap();
 
         if is_leader {
             let elapsed = start.elapsed();
@@ -509,6 +536,12 @@ enum Args {
         #[clap(flatten)]
         config: Config,
     },
+
+    /// Optimize the given dataset
+    OptimizeDataset {
+        #[clap(flatten)]
+        config: Config,
+    },
 }
 
 impl Args {
@@ -517,7 +550,8 @@ impl Args {
             Self::Bfs { config }
             | Self::Pagerank { config }
             | Self::ListDownloaded { config }
-            | Self::ListDatasets { config } => config,
+            | Self::ListDatasets { config }
+            | Self::OptimizeDataset { config } => config,
         }
         .clone()
     }

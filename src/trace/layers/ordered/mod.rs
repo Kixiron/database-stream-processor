@@ -45,6 +45,10 @@ pub struct OrderedLayer<K, L, O = usize> {
 }
 
 impl<K, L, O> OrderedLayer<K, L, O> {
+    pub(crate) fn key_values(&self) -> &[K] {
+        &self.keys
+    }
+
     /// Break down an `OrderedLayer` into its constituent parts
     pub fn into_parts(self) -> (Vec<K>, Vec<O>, L) {
         (self.keys, self.offs, self.vals)
@@ -653,6 +657,62 @@ where
     pub child: L::Cursor<'s>,
 }
 
+impl<'s, K, L, O> OrderedCursor<'s, K, O, L>
+where
+    K: Ord,
+    L: Trie,
+    O: OrdOffset,
+{
+    pub(crate) const fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub(crate) const fn storage(&self) -> &'s OrderedLayer<K, L, O> {
+        self.storage
+    }
+
+    pub(crate) fn advance_to(&mut self, position: usize) {
+        self.pos = min(position, self.bounds.1);
+
+        if self.valid() {
+            self.child.reposition(
+                self.storage.offs[self.pos].into_usize(),
+                self.storage.offs[self.pos + 1].into_usize(),
+            );
+        }
+    }
+
+    pub(crate) fn seek_key_until(&mut self, key: &K, max: usize) {
+        let end_bound = min(self.bounds.1, max);
+        if end_bound <= self.pos {
+            return;
+        }
+
+        self.pos += advance(&self.storage.keys[self.pos..end_bound], |k| k.lt(key));
+
+        if self.valid() {
+            self.child.reposition(
+                self.storage.offs[self.pos].into_usize(),
+                self.storage.offs[self.pos + 1].into_usize(),
+            );
+        }
+    }
+
+    pub fn seek_with<P>(&mut self, predicate: P)
+    where
+        P: Fn(&K) -> bool,
+    {
+        self.pos += advance(&self.storage.keys[self.pos..self.bounds.1], predicate);
+
+        if self.valid() {
+            self.child.reposition(
+                self.storage.offs[self.pos].into_usize(),
+                self.storage.offs[self.pos + 1].into_usize(),
+            );
+        }
+    }
+}
+
 impl<'s, K, O, L> Clone for OrderedCursor<'s, K, O, L>
 where
     K: Ord,
@@ -674,27 +734,6 @@ where
         self.pos.clone_from(&source.pos);
         self.bounds.clone_from(&source.bounds);
         self.child.clone_from(&source.child);
-    }
-}
-
-impl<'s, K, L, O> OrderedCursor<'s, K, O, L>
-where
-    K: Ord,
-    L: Trie,
-    O: OrdOffset,
-{
-    pub fn seek_with<P>(&mut self, predicate: P)
-    where
-        P: Fn(&K) -> bool,
-    {
-        self.pos += advance(&self.storage.keys[self.pos..self.bounds.1], predicate);
-
-        if self.valid() {
-            self.child.reposition(
-                self.storage.offs[self.pos].into_usize(),
-                self.storage.offs[self.pos + 1].into_usize(),
-            );
-        }
     }
 }
 

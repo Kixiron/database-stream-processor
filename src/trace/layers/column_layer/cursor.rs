@@ -3,7 +3,10 @@ use crate::{
     utils::cursor_position_oob,
     DBData, DBWeight,
 };
-use std::fmt::{self, Display};
+use std::{
+    cmp::min,
+    fmt::{self, Display},
+};
 
 /// A cursor for walking through an [`ColumnLayer`].
 #[derive(Debug, Clone)]
@@ -30,12 +33,27 @@ where
         }
     }
 
-    pub(super) const fn storage(&self) -> &'s ColumnLayer<K, R> {
+    pub(in crate::trace) const fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub(in crate::trace) const fn storage(&self) -> &'s ColumnLayer<K, R> {
         self.storage
     }
 
     pub(super) const fn bounds(&self) -> (usize, usize) {
         self.bounds
+    }
+
+    pub(in crate::trace) fn advance_to(&mut self, position: usize) {
+        self.pos = min(position, self.bounds.1);
+    }
+
+    pub fn seek_key_until(&mut self, key: &K, max: usize) {
+        unsafe { self.storage.assume_invariants() }
+        self.pos += advance(&self.storage.keys[self.pos..min(self.bounds.1, max)], |k| {
+            k.lt(key)
+        });
     }
 
     pub fn seek_key(&mut self, key: &K) {

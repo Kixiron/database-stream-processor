@@ -296,10 +296,8 @@ where
     // Create a new `OrdIndexedZSet` from our components, notably this doesn't touch
     // `keys`, `offs` or `diffs` which means we don't allocate new vectors for them
     // or even touch their memory
-    OrdIndexedZSet {
-        // Safety: `keys.len() + 1 == offs.len()`
-        layer: unsafe { OrderedLayer::from_parts(keys, offs, averages) },
-    }
+    // Safety: `keys.len() + 1 == offs.len()`
+    OrdIndexedZSet::from_layers(unsafe { OrderedLayer::from_parts(keys, offs, averages) })
 }
 
 #[cfg(test)]

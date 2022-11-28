@@ -18,6 +18,7 @@ use crate::{
 };
 use size_of::SizeOf;
 use std::{
+    cmp::min,
     fmt::{self, Display},
     mem::MaybeUninit,
     ops::{Add, AddAssign, Neg},
@@ -115,6 +116,26 @@ impl<K, R> ColumnLayer<K, R> {
         self.keys.truncate(length);
         self.diffs.truncate(length);
         unsafe { self.assume_invariants() }
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        unsafe { self.assume_invariants() }
+        self.keys.shrink_to_fit();
+        self.diffs.shrink_to_fit();
+    }
+
+    pub(crate) fn truncate_clone(&self, length: usize) -> Self
+    where
+        K: Clone,
+        R: Clone,
+    {
+        let length = min(length, self.len());
+        let keys = self.keys[..length].to_vec();
+        let diffs = self.diffs[..length].to_vec();
+
+        let this = Self { keys, diffs };
+        unsafe { this.assume_invariants() }
+        this
     }
 
     /// Assume the invariants of the current leaf

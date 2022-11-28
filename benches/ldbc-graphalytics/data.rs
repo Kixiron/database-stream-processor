@@ -1,11 +1,15 @@
+use blake3::Hasher as Blake3Hasher;
 use clap::{PossibleValue, ValueEnum};
+use core::slice;
 use dbsp::{
     algebra::{HasOne, Present, F64},
-    default_hash,
-    trace::{Batch, Batcher, Builder},
+    hash::{default_hash, default_hasher},
+    trace::{layers::column_layer::ColumnLayer, Batch, Batcher, Builder},
     Circuit, OrdIndexedZSet, OrdZSet, Stream,
 };
 use indicatif::{HumanBytes, ProgressBar, ProgressState, ProgressStyle};
+use memmap2::Mmap;
+use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use reqwest::header::CONTENT_LENGTH;
 use std::{
     cmp::Reverse,
@@ -13,11 +17,12 @@ use std::{
     ffi::OsStr,
     fmt::{self, Debug},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, BufWriter, Write},
+    hash::Hasher,
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     mem::size_of,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tar::Archive;
 use zstd::Decoder;
@@ -52,6 +57,151 @@ const DATA_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/benches/ldbc-graphalytics-data",
 );
+const CHECKSUM_CONTEXT: &str = "DBSP LDBC Graphalyics Benchmark 2022-11-20 12:10:51 \
+    producing checksums for optimized datasets";
+
+pub(crate) fn optimize_dataset(dataset: DataSet) {
+    let path = dataset.path();
+    let properties = dataset.properties();
+
+    print!("loading vertices for {}... ", dataset.name);
+    io::stdout().flush().unwrap();
+    let start = Instant::now();
+
+    let vertex_data = VertexParser::new(File::open(path.join(&properties.vertex_file)).unwrap())
+        .load_deduped(properties.vertices as usize);
+
+    let elapsed = start.elapsed();
+    println!("finished in {elapsed:#?}");
+
+    let vertex_path = path.join(format!("{}.bin", properties.vertex_file));
+    let vertex_checksum_path = path.join(format!("{}.bin.checksum", properties.vertex_file));
+    write_optimized_dataset(&vertex_path, &vertex_checksum_path, |writer| {
+        writer
+            .write_all(&(vertex_data.len() as u64).to_le_bytes())
+            .unwrap();
+
+        if cfg!(target_endian = "little") {
+            let vertex_bytes: &[u8] = unsafe {
+                slice::from_raw_parts(
+                    vertex_data.as_ptr().cast(),
+                    vertex_data.len() * size_of::<u64>(),
+                )
+            };
+
+            writer.write_all(vertex_bytes).unwrap();
+        } else {
+            for vertex in &vertex_data {
+                writer.write_all(&vertex.to_le_bytes()).unwrap();
+            }
+        }
+    });
+    drop(vertex_data);
+
+    print!("loading edges for {}... ", dataset.name);
+    io::stdout().flush().unwrap();
+    let start = Instant::now();
+
+    let edge_data = EdgeParser::new(
+        File::open(path.join(&properties.edge_file)).unwrap(),
+        properties.directed,
+    )
+    .load_deduped(properties.edges as usize);
+
+    let elapsed = start.elapsed();
+    println!("finished in {elapsed:#?}");
+
+    let edge_path = path.join(format!("{}.bin", properties.edge_file));
+    let edge_checksum_path = path.join(format!("{}.bin.checksum", properties.edge_file));
+    write_optimized_dataset(&edge_path, &edge_checksum_path, |writer| {
+        writer
+            .write_all(&(edge_data.len() as u64).to_le_bytes())
+            .unwrap();
+
+        if cfg!(target_endian = "little") {
+            let edge_bytes: &[u8] = unsafe {
+                slice::from_raw_parts(
+                    edge_data.as_ptr().cast(),
+                    edge_data.len() * size_of::<[u64; 2]>(),
+                )
+            };
+
+            writer.write_all(edge_bytes).unwrap();
+        } else {
+            for [src, dest] in &edge_data {
+                writer.write_all(&src.to_le_bytes()).unwrap();
+                writer.write_all(&dest.to_le_bytes()).unwrap();
+            }
+        }
+    });
+    drop(edge_data);
+}
+
+fn write_optimized_dataset<F>(data_path: &Path, checksum_path: &Path, write_data: F)
+where
+    F: FnOnce(&mut dyn Write),
+{
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(data_path)
+        .unwrap();
+
+    print!(
+        "started writing optimized version of {}... ",
+        data_path.display(),
+    );
+    io::stdout().flush().unwrap();
+    let start = Instant::now();
+
+    // Write the optimized data to the file
+    let mut writer = BufWriter::new(&mut file);
+    write_data(&mut writer);
+    writer.flush().unwrap();
+    drop(writer);
+
+    let elapsed = start.elapsed();
+    println!("finished in {elapsed:#?}");
+
+    print!(
+        "started computing checksum of of {}... ",
+        data_path.display(),
+    );
+    io::stdout().flush().unwrap();
+    let start = Instant::now();
+
+    // Checksum the file
+    // TODO: Advisory file locking for mmap-ing
+    // TODO: madvise() could be potentially useful here
+    // https://docs.rs/memmap2/latest/memmap2/struct.Mmap.html#method.advise
+    let contents = unsafe { Mmap::map(&file).unwrap() };
+    let checksum = hash_contents(&contents);
+
+    let mut checksum_file = File::create(checksum_path).unwrap();
+    checksum_file.write_all(&checksum).unwrap();
+    checksum_file.flush().unwrap();
+
+    let elapsed = start.elapsed();
+    println!("finished in {elapsed:#?}");
+}
+
+fn hash_contents(contents: &[u8]) -> [u8; 256] {
+    let mut hasher = Blake3Hasher::new_derive_key(CHECKSUM_CONTEXT);
+
+    // `Hasher::update_rayon()` only yields performance benefits for buffers longer
+    // than 128KiB
+    if contents.len() > 1 << 17 {
+        hasher.update_rayon(contents);
+    } else {
+        hasher.update(contents);
+    }
+
+    let mut checksum = [0; 256];
+    hasher.finalize_xof().fill(&mut checksum);
+    checksum
+}
 
 pub(crate) fn list_downloaded_benchmarks() {
     let data_path = Path::new(DATA_PATH);
@@ -64,7 +214,7 @@ pub(crate) fn list_downloaded_benchmarks() {
     {
         let path = dir.path();
 
-        if let Ok(dir) = fs::read_dir(&path) {
+        if let Ok(dir) = fs::read_dir(path) {
             for entry in dir.flatten() {
                 let path = entry.path();
                 if path.extension() == Some(OsStr::new("properties")) {
@@ -190,51 +340,125 @@ impl DataSet {
         Path::new(DATA_PATH).join(self.name)
     }
 
-    pub fn load<R: ResultParser>(&self, workers: usize) -> io::Result<LoadedDataset<R>> {
-        let dataset_dir = self.dataset_dir()?;
+    pub fn properties(&self) -> Properties {
+        let dataset_dir = self.dataset_dir().unwrap();
 
         // Open & parse the properties file
         let properties_path = dataset_dir.join(format!("{}.properties", self.name));
         let properties_file = File::open(&properties_path).unwrap_or_else(|error| {
             panic!("failed to open {}: {error}", properties_path.display())
         });
-        let properties = Properties::from_file(self.name, properties_file);
 
-        // Open the edges file
-        let edges_path = dataset_dir.join(&properties.edge_file);
-        let edges = File::open(&edges_path)
-            .unwrap_or_else(|error| panic!("failed to open {}: {error}", edges_path.display()));
+        Properties::from_file(self.name, properties_file)
+    }
+
+    pub fn load<R: ResultParser>(&self, workers: usize) -> io::Result<LoadedDataset<R>> {
+        let dataset_dir = self.dataset_dir()?;
+
+        // Open & parse the properties file
+        let properties = self.properties();
+
+        // Load the edges and vertices in parallel
+        let (data_dir, props) = (dataset_dir.clone(), properties.clone());
+        let edges_handle = thread::spawn(move || {
+            let edges_path = data_dir.join(&props.edge_file);
+            let optimized_edges_path = data_dir.join(format!("{}.bin", props.edge_file));
+            let optimized_edges_checksum_path =
+                data_dir.join(format!("{}.bin.checksum", props.edge_file));
+
+            if optimized_edges_path.exists() && optimized_edges_checksum_path.exists() {
+                let edges = File::open(&optimized_edges_path).unwrap_or_else(|error| {
+                    panic!("failed to open {}: {error}", optimized_edges_path.display())
+                });
+                let contents = unsafe { Mmap::map(&edges).unwrap() };
+                let expected_checksum = hash_contents(&contents);
+
+                let mut checksum_file = File::open(&optimized_edges_checksum_path).unwrap();
+                let mut current_checksum = [0; 256];
+                checksum_file.read_exact(&mut current_checksum).unwrap();
+
+                if current_checksum == expected_checksum {
+                    return Self::load_optimized_edges(&contents, workers, props.directed);
+                } else {
+                    eprintln!(
+                        "checksum for {} doesn't match the file's contents",
+                        optimized_edges_path.display(),
+                    );
+                }
+            }
+
+            let edges = File::open(&edges_path)
+                .unwrap_or_else(|error| panic!("failed to open {}: {error}", edges_path.display()));
+            EdgeParser::new(edges, props.directed).load(props.edges as usize, workers)
+        });
 
         // Open the vertices file
         let vertices_path = dataset_dir.join(&properties.vertex_file);
-        let vertices = File::open(&vertices_path)
-            .unwrap_or_else(|error| panic!("failed to open {}: {error}", vertices_path.display()));
+        let optimized_vertices_path = dataset_dir.join(format!("{}.bin", properties.vertex_file));
+        let optimized_vertices_checksum_path =
+            dataset_dir.join(format!("{}.bin.checksum", properties.vertex_file));
 
-        // Load the edges and vertices in parallel
-        let edges_handle = thread::spawn(move || {
-            EdgeParser::new(edges, properties.directed).load(properties.edges as usize, workers)
-        });
+        let (vertices, vertices_optimized) =
+            if optimized_vertices_path.exists() && optimized_vertices_checksum_path.exists() {
+                let file = File::open(&optimized_vertices_path).unwrap_or_else(|error| {
+                    panic!("failed to open {}: {error}", vertices_path.display())
+                });
+                let contents = unsafe { Mmap::map(&file).unwrap() };
+                let expected_checksum = hash_contents(&contents);
+
+                let mut checksum_file = File::open(&optimized_vertices_checksum_path).unwrap();
+                let mut current_checksum = [0; 256];
+                checksum_file.read_exact(&mut current_checksum).unwrap();
+
+                if current_checksum == expected_checksum {
+                    (file, true)
+                } else {
+                    eprintln!(
+                        "checksum for {} doesn't match the file's contents",
+                        optimized_vertices_path.display(),
+                    );
+                    let file = File::open(&vertices_path).unwrap_or_else(|error| {
+                        panic!("failed to open {}: {error}", vertices_path.display())
+                    });
+                    (file, false)
+                }
+            } else {
+                let file = File::open(&vertices_path).unwrap_or_else(|error| {
+                    panic!("failed to open {}: {error}", vertices_path.display())
+                });
+                (file, false)
+            };
 
         let (vertices, results) = if let Some(suffix) = R::file_suffix() {
-            let vertices_handle = thread::spawn(move || {
-                VertexParser::new(vertices).load(properties.vertices as usize, workers)
-            });
-
-            // Open the results file
             let result_path = dataset_dir.join(format!("{}{suffix}", self.name));
-            let result_file = File::open(&result_path).unwrap_or_else(|error| {
-                panic!("failed to open {}: {error}", result_path.display())
+            let props = properties.clone();
+            let results_handle = thread::spawn(move || {
+                // Open the results file
+                let result_file = File::open(&result_path).unwrap_or_else(|error| {
+                    panic!("failed to open {}: {error}", result_path.display())
+                });
+
+                // Parse the results file in parallel to the vertices file
+                R::load(&props, result_file)
             });
 
-            // Parse the results file in parallel to the vertices file
-            let results = R::load(&properties, result_file);
-            let vertices = vertices_handle.join().unwrap();
+            let vertices = if vertices_optimized {
+                Self::load_optimized_vertices(vertices, workers)
+            } else {
+                VertexParser::new(vertices).load(properties.vertices as usize, workers)
+            };
+            let results = results_handle.join().unwrap();
 
             (vertices, results)
 
         // Otherwise parse the vertices file on this thread
         } else {
-            let vertices = VertexParser::new(vertices).load(properties.vertices as usize, workers);
+            let vertices = if vertices_optimized {
+                Self::load_optimized_vertices(vertices, workers)
+            } else {
+                VertexParser::new(vertices).load(properties.vertices as usize, workers)
+            };
+
             (vertices, R::Parsed::default())
         };
 
@@ -242,6 +466,134 @@ impl DataSet {
         let edges = edges_handle.join().unwrap();
 
         Ok((properties, edges, vertices, results))
+    }
+
+    fn load_optimized_vertices(file: File, workers: usize) -> Vec<OrdZSet<u64, Present>> {
+        let contents = unsafe { Mmap::map(&file).unwrap() };
+        let length = u64::from_le_bytes(contents[..size_of::<u64>()].try_into().unwrap()) as usize;
+        let vertices = unsafe {
+            slice::from_raw_parts(
+                contents.as_ptr().add(size_of::<u64>()).cast::<u64>(),
+                length,
+            )
+        };
+
+        if workers == 1 {
+            let mut keys = vertices.to_vec();
+
+            // TODO: Vectorized bswap
+            if cfg!(target_endian = "big") {
+                for key in &mut keys {
+                    *key = key.swap_bytes();
+                }
+            }
+
+            let diffs = vec![Present; keys.len()];
+            vec![OrdZSet::from_layer(unsafe {
+                ColumnLayer::from_parts(keys, diffs)
+            })]
+        } else {
+            let mut keys: Vec<_> = (0..workers)
+                .map(|_| Vec::with_capacity(length / workers))
+                .collect();
+
+            let mut hasher = default_hasher();
+            for &vertex in vertices {
+                let vertex = if cfg!(target_endian = "little") {
+                    vertex
+                } else {
+                    vertex.swap_bytes()
+                };
+
+                hasher.write_u64(vertex);
+                let shard = hasher.finish() as usize % workers;
+                keys[shard].push(vertex);
+                hasher.reset();
+            }
+
+            keys.into_iter()
+                .map(|mut keys| {
+                    keys.shrink_to_fit();
+
+                    let diffs = vec![Present; keys.len()];
+                    OrdZSet::from_layer(unsafe { ColumnLayer::from_parts(keys, diffs) })
+                })
+                .collect()
+        }
+    }
+
+    fn load_optimized_edges(contents: &[u8], workers: usize, directed: bool) -> Vec<EdgeMap> {
+        let length = u64::from_le_bytes(contents[..size_of::<u64>()].try_into().unwrap()) as usize;
+        let vertices = unsafe {
+            slice::from_raw_parts(
+                contents.as_ptr().add(size_of::<u64>()).cast::<[u64; 2]>(),
+                length,
+            )
+        };
+
+        if directed {
+            let mut edges: Vec<_> = (0..workers)
+                .map(|_| <EdgeMap as Batch>::Builder::with_capacity((), length / workers))
+                .collect();
+
+            let mut hasher = default_hasher();
+            for &vertex in vertices {
+                let [src, dest] = if cfg!(target_endian = "little") {
+                    vertex
+                } else {
+                    [vertex[0].swap_bytes(), vertex[1].swap_bytes()]
+                };
+
+                hasher.write_u64(src);
+                let shard = hasher.finish() as usize % workers;
+                edges[shard].push(((src, dest), Present));
+                hasher.reset();
+            }
+
+            edges.into_iter().map(Builder::done).collect()
+        } else {
+            let mut batches: Vec<_> = (0..workers)
+                .map(|_| {
+                    (
+                        Vec::with_capacity(length / workers / 2),
+                        Vec::with_capacity(length / workers / 2),
+                    )
+                })
+                .collect();
+
+            let mut hasher = default_hasher();
+            for &vertex in vertices {
+                let [src, dest] = if cfg!(target_endian = "little") {
+                    vertex
+                } else {
+                    [vertex[0].swap_bytes(), vertex[1].swap_bytes()]
+                };
+
+                hasher.write_u64(src);
+                let shard = hasher.finish() as usize % workers;
+                batches[shard].0.push(((src, dest), Present));
+                hasher.reset();
+
+                hasher.write_u64(dest);
+                let shard = hasher.finish() as usize % workers;
+                batches[shard].1.push(((dest, src), Present));
+                hasher.reset();
+            }
+
+            let mut edges = Vec::with_capacity(batches.len());
+            batches
+                .into_par_iter()
+                .map(|(mut forward, mut reverse)| {
+                    let mut edges = <EdgeMap as Batch>::Batcher::new_batcher(());
+                    edges.push_consolidated_batch(&mut forward);
+                    reverse.sort_unstable_by_key(|&((dest, _), _)| dest);
+                    edges.push_consolidated_batch(&mut reverse);
+                    edges.seal()
+                })
+                .collect_into_vec(&mut edges);
+
+            edges
+        }
     }
 
     pub fn load_results<R: ResultParser>(&self, props: &Properties) -> io::Result<R::Parsed> {
@@ -615,6 +967,12 @@ impl EdgeParser {
         }
     }
 
+    pub fn load_deduped(self, approx_edges: usize) -> Vec<[u64; 2]> {
+        let mut edges = Vec::with_capacity(approx_edges);
+        self.parse(|src, dest| edges.push([src, dest]));
+        edges
+    }
+
     pub fn load(self, approx_edges: usize, workers: usize) -> Vec<EdgeMap> {
         // Directed graphs can use an ordered builder
         if self.directed {
@@ -622,37 +980,53 @@ impl EdgeParser {
                 .map(|_| <EdgeMap as Batch>::Builder::with_capacity((), approx_edges / workers))
                 .collect();
 
+            let mut hasher = default_hasher();
             self.parse(|src, dest| {
-                edges[default_hash(&src) as usize % workers].push(((src, dest), Present));
+                hasher.write_u64(src);
+                let shard = hasher.finish() as usize % workers;
+                edges[shard].push(((src, dest), Present));
+                hasher.reset();
             });
 
             edges.into_iter().map(Builder::done).collect()
 
         // Undirected graphs must use an unordered builder
         } else {
-            let mut forward_batches: Vec<_> = (0..workers)
-                .map(|_| Vec::with_capacity(approx_edges / workers / 2))
-                .collect();
-            let mut reverse_batches: Vec<_> = (0..workers)
-                .map(|_| Vec::with_capacity(approx_edges / workers / 2))
+            let mut batches: Vec<_> = (0..workers)
+                .map(|_| {
+                    (
+                        Vec::with_capacity(approx_edges / workers / 2),
+                        Vec::with_capacity(approx_edges / workers / 2),
+                    )
+                })
                 .collect();
 
+            let mut hasher = default_hasher();
             self.parse(|src, dest| {
-                forward_batches[default_hash(&src) as usize % workers].push(((src, dest), Present));
-                reverse_batches[default_hash(&dest) as usize % workers]
-                    .push(((dest, src), Present));
+                hasher.write_u64(src);
+                let shard = hasher.finish() as usize % workers;
+                batches[shard].0.push(((src, dest), Present));
+                hasher.reset();
+
+                hasher.write_u64(dest);
+                let shard = hasher.finish() as usize % workers;
+                batches[shard].1.push(((dest, src), Present));
+                hasher.reset();
             });
 
-            forward_batches
-                .into_iter()
-                .zip(reverse_batches)
+            let mut edges = Vec::with_capacity(batches.len());
+            batches
+                .into_par_iter()
                 .map(|(mut forward, mut reverse)| {
                     let mut edges = <EdgeMap as Batch>::Batcher::new_batcher(());
                     edges.push_consolidated_batch(&mut forward);
-                    edges.push_batch(&mut reverse);
+                    reverse.sort_unstable_by_key(|&((dest, _), _)| dest);
+                    edges.push_consolidated_batch(&mut reverse);
                     edges.seal()
                 })
-                .collect()
+                .collect_into_vec(&mut edges);
+
+            edges
         }
     }
 
@@ -690,6 +1064,12 @@ impl VertexParser {
         }
     }
 
+    pub fn load_deduped(self, approx_edges: usize) -> Vec<u64> {
+        let mut vertices = Vec::with_capacity(approx_edges);
+        self.parse(|vertex| vertices.push(vertex));
+        vertices
+    }
+
     pub fn load(self, approx_vertices: usize, workers: usize) -> Vec<VertexSet> {
         // The vertices file is ordered so we can use an ordered builder
         let mut vertices: Vec<_> = (0..workers)
@@ -723,7 +1103,7 @@ impl VertexParser {
 }
 
 pub trait ResultParser {
-    type Parsed: Default;
+    type Parsed: Default + Send + 'static;
 
     fn file_suffix() -> Option<&'static str>;
 

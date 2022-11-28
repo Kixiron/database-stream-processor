@@ -28,6 +28,7 @@ pub mod val_batch;
 pub mod zset_batch;
 
 mod merge_batcher;
+mod zset_index;
 
 pub use indexed_zset_batch::OrdIndexedZSet;
 pub use key_batch::OrdKeyBatch;

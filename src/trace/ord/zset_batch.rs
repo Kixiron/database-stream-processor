@@ -9,7 +9,7 @@ use crate::{
             },
             Builder as TrieBuilder, Cursor as TrieCursor, MergeBuilder, Trie, TupleBuilder,
         },
-        ord::merge_batcher::MergeBatcher,
+        ord::{merge_batcher::MergeBatcher, zset_index::ZSetIndex},
         Batch, BatchReader, Builder, Consumer, Cursor, Merger, ValueConsumer,
     },
     DBData, DBWeight, NumEntries,
@@ -23,13 +23,21 @@ use std::{
 };
 
 /// An immutable collection of `(key, weight)` pairs without timing information.
-#[derive(Debug, Clone, Eq, PartialEq, SizeOf)]
+#[derive(Debug, Clone, SizeOf)]
 pub struct OrdZSet<K, R> {
     #[doc(hidden)]
     pub layer: ColumnLayer<K, R>,
+    index: ZSetIndex<K>,
 }
 
 impl<K, R> OrdZSet<K, R> {
+    pub const fn from_layer(layer: ColumnLayer<K, R>) -> Self {
+        Self {
+            layer,
+            index: ZSetIndex::uninit(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.layer.len()
     }
@@ -42,7 +50,42 @@ impl<K, R> OrdZSet<K, R> {
     where
         F: FnMut(&K, &R) -> bool,
     {
+        self.index.invalidate();
         self.layer.retain(retain);
+    }
+
+    pub fn truncate(&mut self, length: usize) {
+        self.index.truncate(length);
+        self.layer.truncate(length);
+    }
+
+    pub fn truncate_clone(&self, length: usize) -> Self
+    where
+        K: Clone,
+        R: Clone,
+    {
+        Self::from_layer(self.layer.truncate_clone(length))
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.layer.shrink_to_fit();
+    }
+}
+
+impl<K, R> Eq for OrdZSet<K, R>
+where
+    K: Eq,
+    R: Eq,
+{
+}
+
+impl<K, R> PartialEq for OrdZSet<K, R>
+where
+    K: PartialEq,
+    R: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.layer == other.layer
     }
 }
 
@@ -62,13 +105,13 @@ where
 
 impl<K, R> From<ColumnLayer<K, R>> for OrdZSet<K, R> {
     fn from(layer: ColumnLayer<K, R>) -> Self {
-        Self { layer }
+        Self::from_layer(layer)
     }
 }
 
 impl<K, R> From<ColumnLayer<K, R>> for Rc<OrdZSet<K, R>> {
     fn from(layer: ColumnLayer<K, R>) -> Self {
-        Rc::new(From::from(layer))
+        Rc::new(layer.into())
     }
 }
 
@@ -92,6 +135,7 @@ impl<K, R> Default for OrdZSet<K, R> {
     fn default() -> Self {
         Self {
             layer: ColumnLayer::empty(),
+            index: ZSetIndex::empty(),
         }
     }
 }
@@ -102,9 +146,7 @@ where
     R: MonoidValue + NegByRef,
 {
     fn neg_by_ref(&self) -> Self {
-        Self {
-            layer: self.layer.neg_by_ref(),
-        }
+        Self::from_layer(self.layer.neg_by_ref())
     }
 }
 
@@ -118,6 +160,9 @@ where
     fn neg(self) -> Self {
         Self {
             layer: self.layer.neg(),
+            // `ColumnLayer::neg()` doesn't invalidate `keys` in any way so we can pass on `index`
+            // unaffected
+            index: self.index,
         }
     }
 }
@@ -131,9 +176,7 @@ where
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        Self {
-            layer: self.layer.add(rhs.layer),
-        }
+        Self::from_layer(self.layer.add(rhs.layer))
     }
 }
 
@@ -143,6 +186,7 @@ where
     R: MonoidValue,
 {
     fn add_assign(&mut self, rhs: Self) {
+        self.index.invalidate();
         self.layer.add_assign(rhs.layer);
     }
 }
@@ -153,6 +197,7 @@ where
     R: MonoidValue,
 {
     fn add_assign_by_ref(&mut self, rhs: &Self) {
+        self.index.invalidate();
         self.layer.add_assign_by_ref(&rhs.layer);
     }
 }
@@ -163,9 +208,7 @@ where
     R: MonoidValue,
 {
     fn add_by_ref(&self, rhs: &Self) -> Self {
-        Self {
-            layer: self.layer.add_by_ref(&rhs.layer),
-        }
+        Self::from_layer(self.layer.add_by_ref(&rhs.layer))
     }
 }
 
@@ -185,6 +228,7 @@ where
     fn cursor(&self) -> Self::Cursor<'_> {
         OrdZSetCursor {
             valid: true,
+            index: &self.index,
             cursor: self.layer.cursor(),
         }
     }
@@ -242,9 +286,7 @@ where
     fn recede_to(&mut self, _frontier: &()) {}
 
     fn empty(_time: Self::Time) -> Self {
-        Self {
-            layer: ColumnLayer::empty(),
-        }
+        Self::default()
     }
 }
 
@@ -275,9 +317,7 @@ where
     }
 
     fn done(self) -> OrdZSet<K, R> {
-        OrdZSet {
-            layer: self.result.done(),
-        }
+        OrdZSet::from_layer(self.result.done())
     }
 
     fn work(&mut self, source1: &OrdZSet<K, R>, source2: &OrdZSet<K, R>, fuel: &mut isize) {
@@ -296,6 +336,7 @@ where
     R: DBWeight,
 {
     valid: bool,
+    index: &'s ZSetIndex<K>,
     cursor: ColumnLayerCursor<'s, K, R>,
 }
 
@@ -349,8 +390,36 @@ where
     }
 
     fn seek_key(&mut self, key: &K) {
-        self.cursor.seek_key(key);
-        self.valid = true;
+        // /*
+        self.index.crack(self.cursor.storage().keys(), |index| {
+            let current = self.cursor.position();
+            // Interestingly it seems that *not* limiting the binary search to values past
+            // the current cursor's position yields significantly better performance (in my
+            // tests turing 84 seconds for the ldbc datagen-8_4-fb benchmark to 73 seconds
+            // for a ~13% improvement)
+
+            match index.binary_search_by(|&rhs| unsafe { key.cmp(rhs.as_ref()) }) {
+                // If one of the index values is the same as the key, we can advance directly to
+                // that value
+                Ok(idx) => self
+                    .cursor
+                    .advance_to(max(idx * ZSetIndex::<K>::BUCKET_SIZE, current)),
+
+                // Otherwise the value should lie between the `idx` and `idx + 1` buckets (the
+                // first element in the layer is skipped)
+                Err(idx) => {
+                    self.cursor
+                        .advance_to(max(idx * ZSetIndex::<K>::BUCKET_SIZE, current));
+                    self.cursor.seek_key(key);
+                }
+            }
+
+            self.valid = true;
+        });
+        // */
+
+        // self.cursor.seek_key(key);
+        // self.valid = true;
     }
 
     fn last_key(&mut self) -> Option<&K> {
@@ -424,9 +493,7 @@ where
 
     #[inline(never)]
     fn done(self) -> OrdZSet<K, R> {
-        OrdZSet {
-            layer: self.builder.done(),
-        }
+        OrdZSet::from_layer(self.builder.done())
     }
 }
 
@@ -457,6 +524,7 @@ impl<K, R> Consumer<K, (), R, ()> for OrdZSetConsumer<K, R> {
     where
         K: Ord,
     {
+        // TODO: Utilize indices for seeking
         self.consumer.seek_key(key);
     }
 }

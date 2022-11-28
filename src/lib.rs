@@ -2,7 +2,6 @@
 #![doc = include_str!("../README.md")]
 
 mod error;
-mod hash;
 mod num_entries;
 mod ref_pair;
 mod utils;
@@ -10,6 +9,7 @@ mod utils;
 #[macro_use]
 pub mod circuit;
 pub mod algebra;
+pub mod hash;
 pub mod monitor;
 pub mod operator;
 pub mod profile;
