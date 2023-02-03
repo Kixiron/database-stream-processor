@@ -31,7 +31,7 @@ where
         return;
     }
 
-    vec.sort_unstable_by(|(key1, _), (key2, _)| key1.cmp(key2));
+    glidesort::sort_in_vec_by(vec, |(key1, _), (key2, _)| key1.cmp(key2));
     // TODO: Combine the `.dedup_by()` and `.retain()` calls together
     vec.dedup_by(|(key1, data1), (key2, data2)| {
         if key1 == key2 {
@@ -59,7 +59,7 @@ where
         return;
     }
 
-    vec[offset..].sort_unstable_by(|(key1, _), (key2, _)| key1.cmp(key2));
+    glidesort::sort_by(&mut vec[offset..], |(key1, _), (key2, _)| key1.cmp(key2));
     dedup_starting_at(vec, offset, |(key1, data1), (key2, data2)| {
         if key1 == key2 {
             data2.add_assign(replace(data1, R::zero()));
@@ -148,7 +148,7 @@ where
     // Ideally we'd combine the sorting and value merging portions
     // This line right here is literally the hottest code within the entirety of the
     // program. It makes up 90% of the work done while joining or merging anything
-    slice.sort_unstable_by(|(key1, _), (key2, _)| key1.cmp(key2));
+    glidesort::sort_by(slice, |(key1, _), (key2, _)| key1.cmp(key2));
     consolidate_slice_inner(
         slice,
         |(key1, _), (key2, _)| key1 == key2,

@@ -44,7 +44,7 @@ where
     )
 }
 
-// Consolidation using stable sorting and native std functions
+// Consolidation using stable sorting and naive std functions
 fn consolidate_naive_stable<T, D>(slice: &mut Vec<(T, D)>)
 where
     T: Ord,
@@ -62,13 +62,63 @@ where
     slice.retain(|(_, data)| !data.is_zero());
 }
 
-// Consolidation using unstable sorting and native std functions
+// Consolidation using unstable sorting and naive std functions
 fn consolidate_naive_unstable<T, D>(slice: &mut Vec<(T, D)>)
 where
     T: Ord,
     D: AddAssign + HasZero,
 {
     slice.sort_unstable_by(|(key1, _), (key2, _)| key1.cmp(key2));
+    slice.dedup_by(|(key1, data1), (key2, data2)| {
+        if key1 == key2 {
+            data2.add_assign(replace(data1, D::zero()));
+            true
+        } else {
+            false
+        }
+    });
+    slice.retain(|(_, data)| !data.is_zero());
+}
+
+// Consolidation using stable sorting
+fn consolidate_slice_glidesort<T, D>(slice: &mut [(T, D)]) -> usize
+where
+    T: Ord,
+    D: AddAssignByRef + HasZero,
+{
+    glidesort::sort_by(slice, |(key1, _), (key2, _)| key1.cmp(key2));
+    consolidation::consolidate_slice_inner(
+        slice,
+        |(key1, _), (key2, _)| key1 == key2,
+        |(_, diff1), (_, diff2)| diff1.add_assign_by_ref(diff2),
+        |(_, diff)| diff.is_zero(),
+    )
+}
+
+// Consolidation using stable sorting and naive std functions
+fn consolidate_glidesort<T, D>(slice: &mut Vec<(T, D)>)
+where
+    T: Ord,
+    D: AddAssign + HasZero,
+{
+    glidesort::sort_by(slice, |(key1, _), (key2, _)| key1.cmp(key2));
+    slice.dedup_by(|(key1, data1), (key2, data2)| {
+        if key1 == key2 {
+            data2.add_assign(replace(data1, D::zero()));
+            true
+        } else {
+            false
+        }
+    });
+    slice.retain(|(_, data)| !data.is_zero());
+}
+
+fn consolidate_glidesort_in_vec<T, D>(slice: &mut Vec<(T, D)>)
+where
+    T: Ord,
+    D: AddAssign + HasZero,
+{
+    glidesort::sort_in_vec_by(slice, |(key1, _), (key2, _)| key1.cmp(key2));
     slice.dedup_by(|(key1, data1), (key2, data2)| {
         if key1 == key2 {
             data2.add_assign(replace(data1, D::zero()));
@@ -111,6 +161,20 @@ macro_rules! consolidation_benches {
             )*
             group.finish();
 
+            let mut group = c.benchmark_group("consolidate-slice-glidesort");
+            $(
+                group.bench_function($name, |b| {
+                    let unsorted = data::<((usize, usize), isize)>($size);
+
+                    b.iter_batched(
+                        || unsorted.clone(),
+                        |mut unsorted| consolidate_slice_glidesort(black_box(&mut unsorted)),
+                        BatchSize::PerIteration,
+                    );
+                });
+            )*
+            group.finish();
+
             let mut group = c.benchmark_group("consolidate-naive-unstable");
             $(
                 group.bench_function($name, |b| {
@@ -139,6 +203,34 @@ macro_rules! consolidation_benches {
             )*
             group.finish();
 
+            let mut group = c.benchmark_group("consolidate-glidesort");
+            $(
+                group.bench_function($name, |b| {
+                    let unsorted = data::<((usize, usize), isize)>($size);
+
+                    b.iter_batched(
+                        || unsorted.clone(),
+                        |mut unsorted| consolidate_glidesort(black_box(&mut unsorted)),
+                        BatchSize::PerIteration,
+                    );
+                });
+            )*
+            group.finish();
+
+            let mut group = c.benchmark_group("consolidate-glidesort-in-vec");
+            $(
+                group.bench_function($name, |b| {
+                    let unsorted = data::<((usize, usize), isize)>($size);
+
+                    b.iter_batched(
+                        || unsorted.clone(),
+                        |mut unsorted| consolidate_glidesort_in_vec(black_box(&mut unsorted)),
+                        BatchSize::PerIteration,
+                    );
+                });
+            )*
+            group.finish();
+
             let mut group = c.benchmark_group("unstable-sort");
             $(
                 group.bench_function($name, |b| {
@@ -161,6 +253,20 @@ macro_rules! consolidation_benches {
                     b.iter_batched(
                         || unsorted.clone(),
                         |mut unsorted| black_box(&mut unsorted).sort_by(|(key1, _), (key2, _)| key1.cmp(key2)),
+                        BatchSize::PerIteration,
+                    );
+                });
+            )*
+            group.finish();
+
+            let mut group = c.benchmark_group("glidesort");
+            $(
+                group.bench_function($name, |b| {
+                    let unsorted = data::<((usize, usize), isize)>($size);
+
+                    b.iter_batched(
+                        || unsorted.clone(),
+                        |mut unsorted| black_box(glidesort::sort_by(&mut unsorted, |(key1, _), (key2, _)| key1.cmp(key2))),
                         BatchSize::PerIteration,
                     );
                 });
