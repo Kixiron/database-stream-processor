@@ -64,7 +64,7 @@ pub(crate) fn list_downloaded_benchmarks() {
     {
         let path = dir.path();
 
-        if let Ok(dir) = fs::read_dir(&path) {
+        if let Ok(dir) = fs::read_dir(path) {
             for entry in dir.flatten() {
                 let path = entry.path();
                 if path.extension() == Some(OsStr::new("properties")) {
